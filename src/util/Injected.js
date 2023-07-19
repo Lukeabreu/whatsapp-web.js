@@ -2,10 +2,12 @@
 
 // Exposes the internal Store to the WhatsApp Web client
 exports.ExposeStore = (moduleRaidStr) => {
+
     eval('var moduleRaid = ' + moduleRaidStr);
     // eslint-disable-next-line no-undef
     window.mR = moduleRaid();
     window.Store = Object.assign({}, window.mR.findModule(m => m.default && m.default.Chat)[0].default);
+    window.Store.linkPreviewCache = {};
     window.Store.AppState = window.mR.findModule('Socket')[0].Socket;
     window.Store.Conn = window.mR.findModule('Conn')[0].Conn;
     window.Store.BlockContact = window.mR.findModule('blockContact')[0];
@@ -31,7 +33,6 @@ exports.ExposeStore = (moduleRaidStr) => {
     window.Store.SendClear = window.mR.findModule('sendClear')[0];
     window.Store.SendDelete = window.mR.findModule('sendDelete')[0];
     window.Store.SendMessage = window.mR.findModule('addAndSendMsgToChat')[0];
-    window.Store.EditMessage = window.mR.findModule('addAndSendMessageEdit')[0];
     window.Store.SendSeen = window.mR.findModule('sendSeen')[0];
     window.Store.User = window.mR.findModule('getMaybeMeUser')[0];
     window.Store.UploadUtils = window.mR.findModule((module) => (module.default && module.default.encryptAndUpload) ? module.default : null)[0].default;
@@ -61,7 +62,7 @@ exports.ExposeStore = (moduleRaidStr) => {
         ...window.mR.findModule('toWebpSticker')[0],
         ...window.mR.findModule('addWebpMetadata')[0]
     };
-  
+
     window.Store.GroupUtils = {
         ...window.mR.findModule('createGroup')[0],
         ...window.mR.findModule('setGroupDescription')[0],
@@ -78,11 +79,10 @@ exports.ExposeStore = (moduleRaidStr) => {
         };
     }
 
-    // TODO remove these once everybody has been updated to WWebJS with legacy sessions removed
-    const _linkPreview = window.mR.findModule('queryLinkPreview');
-    if (_linkPreview && _linkPreview[0] && _linkPreview[0].default) {
-        window.Store.Wap = _linkPreview[0].default;
-    }
+    window.Store.reg = window.mR.findModule('registerLinkPreviewHandlerHook')[0];
+    window.Store.sendPeer = window.mR.findModule('sendPeerDataOperationRequest')[0];
+    window.Store.genMin = window.mR.findModule('genMinimalLinkPreview')[0];
+    window.Store.promiseTimeout = window.mR.findModule('promiseTimeout')[0];
 
     const _isMDBackend = window.mR.findModule('isMDBackend');
     if(_isMDBackend && _isMDBackend[0] && _isMDBackend[0].isMDBackend) {
@@ -120,9 +120,9 @@ exports.LoadUtils = () => {
                     forceDocument: options.sendMediaAsDocument,
                     forceGif: options.sendVideoAsGif
                 });
-            
-            if (options.caption){
-                attOptions.caption = options.caption; 
+
+            if (options.caption  || options.caption === ""){
+                attOptions.caption = options.caption;
             }
             content = options.sendMediaAsSticker ? undefined : attOptions.preview;
 
@@ -134,8 +134,8 @@ exports.LoadUtils = () => {
             let quotedMessage = window.Store.Msg.get(options.quotedMessageId);
 
             // TODO remove .canReply() once all clients are updated to >= v2.2241.6
-            const canReply = window.Store.ReplyUtils ? 
-                window.Store.ReplyUtils.canReplyMsg(quotedMessage.unsafe()) : 
+            const canReply = window.Store.ReplyUtils ?
+                window.Store.ReplyUtils.canReplyMsg(quotedMessage.unsafe()) :
                 quotedMessage.canReply();
 
             if (canReply) {
@@ -196,17 +196,73 @@ exports.LoadUtils = () => {
             delete options.linkPreview;
 
             // Not supported yet by WhatsApp Web on MD
-            if(!window.Store.MDBackend) {
+            if(window.Store.MDBackend) {
                 const link = window.Store.Validators.findLink(content);
                 if (link) {
-                    const preview = await window.Store.Wap.queryLinkPreview(link.url);
+
+                    let preview = {}
+                    try{
+                        // check if link is in linkPreviewCache and use it
+                        if (window.Store.linkPreviewCache[link.url]) {
+                            preview = window.Store.linkPreviewCache[link.url]
+                        } else {
+
+                            let promise =  window.Store.reg.registerLinkPreviewHandlerHook("12345")
+                            window.Store.sendPeer.sendPeerDataOperationRequest(2, {
+                                urls: [link.url],
+                                includeHqThumbnail: true
+                            }, "12345");
+                            let prevResponse = await window.Store.promiseTimeout.promiseTimeout(promise.promise, 5000)
+
+                            let linkPreviewResponse = prevResponse.linkPreviewResponse
+                            let prevDescription= linkPreviewResponse.description
+                            let hqThumbnail = linkPreviewResponse.hqThumbnail
+                            if (!hqThumbnail) {
+                                throw new Error("No hqThumbnail")
+                            }
+                            let mediaKey = hqThumbnail.mediaKey
+                            let mediaKeyEncoded = window.WWebJS.arrayBufferToBase64(mediaKey)
+
+                            preview= {
+                                title: linkPreviewResponse.title,
+                                description: prevDescription,
+                                canonicalUrl: linkPreviewResponse.url,
+                                matchedText: linkPreviewResponse.url,
+                                richPreviewType: 0,
+                                thumbnail: linkPreviewResponse.thumbData ? window.WWebJS.arrayBufferToBase64(linkPreviewResponse.thumbData) : "",
+                                thumbnailHQ: undefined,
+                                thumbnailHeight: hqThumbnail.thumbHeight,
+                                thumbnailWidth: hqThumbnail.thumbWidth,
+                                thumbnailDirectPath: null == hqThumbnail ? void 0 : hqThumbnail.directPath,
+                                thumbnailEncSha256: null == hqThumbnail ? void 0 : hqThumbnail.encThumbHash,
+                                thumbnailSha256: null == hqThumbnail ? void 0 : hqThumbnail.thumbHash,
+                                mediaKeyTimestamp: parseInt(new Date().getTime() / 1000),
+                                mediaKey: mediaKeyEncoded,
+                                doNotPlayInline: true,
+                                isLoading: false
+                            }
+                            window.Store.linkPreviewCache[link.url] = preview
+
+                        }
+
+
+                    }catch (t){
+
+                        if (t.toString().startsWith("TimeoutError") || t.toString().startsWith("Error: No hqThumbnail")){
+                            preview = window.Store.genMin.genMinimalLinkPreview(link).data
+                        }
+                        else throw t
+                    }
+
                     preview.preview = true;
                     preview.subtype = 'url';
+                    preview.isLoading = false;
+
                     options = { ...options, ...preview };
                 }
             }
         }
-        
+
         let buttonOptions = {};
         if(options.buttons){
             let caption;
@@ -250,7 +306,7 @@ exports.LoadUtils = () => {
         const meUser = window.Store.User.getMaybeMeUser();
         const isMD = window.Store.MDBackend;
         const newId = await window.Store.MsgKey.newId();
-        
+
         const newMsgId = new window.Store.MsgKey({
             from: meUser,
             to: chat.id,
@@ -286,43 +342,10 @@ exports.LoadUtils = () => {
             ...listOptions,
             ...extraOptions
         };
+        // throw new Error('reached: ' + JSON.stringify(message))
 
         await window.Store.SendMessage.addAndSendMsgToChat(chat, message);
         return window.Store.Msg.get(newMsgId._serialized);
-    };
-	
-    window.WWebJS.editMessage = async (msg, content, options = {}) => {
-
-        const extraOptions = options.extraOptions || {};
-        delete options.extraOptions;
-        
-        if (options.mentionedJidList) {
-            options.mentionedJidList = options.mentionedJidList.map(cId => window.Store.Contact.get(cId).id);
-        }
-
-        if (options.linkPreview) {
-            options.linkPreview = null;
-
-            // Not supported yet by WhatsApp Web on MD
-            if(!window.Store.MDBackend) {
-                const link = window.Store.Validators.findLink(content);
-                if (link) {
-                    const preview = await window.Store.Wap.queryLinkPreview(link.url);
-                    preview.preview = true;
-                    preview.subtype = 'url';
-                    options = { ...options, ...preview };
-                }
-            }
-        }
-
-
-        const internalOptions = {
-            ...options,
-            ...extraOptions
-        };
-
-        await window.Store.EditMessage.sendMessageEdit(msg, content, internalOptions);
-        return window.Store.Msg.get(msg.id._serialized);
     };
 
     window.WWebJS.toStickerData = async (mediaInfo) => {
@@ -469,7 +492,7 @@ exports.LoadUtils = () => {
             await window.Store.GroupMetadata.update(chatWid);
             res.groupMetadata = chat.groupMetadata.serialize();
         }
-        
+
         res.lastMessage = null;
         if (res.msgs && res.msgs.length) {
             const lastMessage = window.Store.Msg.get(chat.lastReceivedKey._serialized);
@@ -477,7 +500,7 @@ exports.LoadUtils = () => {
                 res.lastMessage = window.WWebJS.getMessageModel(lastMessage);
             }
         }
-        
+
         delete res.msgs;
         delete res.msgUnsyncedButtonReplyMsgs;
         delete res.unsyncedButtonReplies;
@@ -607,17 +630,17 @@ exports.LoadUtils = () => {
             chatId = window.Store.WidFactory.createWid(chatId);
         }
         switch (state) {
-        case 'typing':
-            await window.Store.ChatState.sendChatStateComposing(chatId);
-            break;
-        case 'recording':
-            await window.Store.ChatState.sendChatStateRecording(chatId);
-            break;
-        case 'stop':
-            await window.Store.ChatState.sendChatStatePaused(chatId);
-            break;
-        default:
-            throw 'Invalid chatstate';
+            case 'typing':
+                await window.Store.ChatState.sendChatStateComposing(chatId);
+                break;
+            case 'recording':
+                await window.Store.ChatState.sendChatStateRecording(chatId);
+                break;
+            case 'stop':
+                await window.Store.ChatState.sendChatStatePaused(chatId);
+                break;
+            default:
+                throw 'Invalid chatstate';
         }
 
         return true;
